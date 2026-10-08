@@ -1,36 +1,28 @@
 # DMZ-VPC 统一公网出入口 Landing Zone
 
-本工程基于 **单一 `volcenginecc` Provider**，在火山引擎上通过中转路由器 Transit Router 将 dmz / dev / prd 三个 VPC 组成星型拓扑，把公网**出向**收敛到 dmz NAT、公网**入向**收敛到 dmz 公网 ALB，并将 NAT EIP 与 ALB EIP 纳入共享带宽包，一键 `terraform apply` 即可交付一套集中式的公网出入口 Landing Zone。
-
-***
+在火山引擎上部署一套集中式的公网出入口 Landing Zone，覆盖网络、路由、公网出向（NAT）、公网入向（ALB）、带宽聚合与工作负载等核心资源。该方案基于**单一 `volcenginecc` Provider**，通过中转路由器 Transit Router 将 dmz / dev / prd 三个 VPC 组成星型拓扑，把公网出向收敛到 dmz NAT、公网入向收敛到 dmz 公网 ALB，并将 NAT EIP 与 ALB EIP 纳入共享带宽包，一键 `terraform apply` 即可完成交付。
 
 ## 1. 业务背景
 
-随着企业上云，多业务线 / 多环境的 VPC 数量快速膨胀，传统"每个 VPC 各自挂 EIP / NAT"的做法带来三类痛点：
+随着企业上云，多业务线 / 多环境的 VPC 数量快速膨胀，传统“每个 VPC 各自挂 EIP / NAT”的做法通常会遇到以下问题：
 
 - **公网出向碎片化**：每个 VPC 独立分配 NAT + EIP，出向 IP 散乱难治理、白名单维护成本高、带宽难以聚合议价。
 - **公网入向暴露面大**：每个 VPC 都对外开放 ALB/SLB，安全审计与 WAF 部署点分散，攻击面成倍增长。
-- **跨 VPC 互通混乱**：业务流量在多个 VPC 间走 VPN/对等连接拼接，路由策略难以集中管理，故障排查链路长。
+- **跨 VPC 互通混乱**：业务流量在多个 VPC 间走 VPN / 对等连接拼接，路由策略难以集中管理，故障排查链路长。
+- **扩展和回收成本高**：手工搭建多 VPC 互联环境易出错，验证结束后也需要可靠销毁资源，降低闲置成本。
 
-工程目标是落地一套**集中式 DMZ-VPC**：
-
-1. 通过 **中转路由器 Transit Router** 把 dmz / dev / prd 三个业务 VPC 串成星型拓扑，路由策略集中在 TR。
-2. 公网**出向**统一收敛到 dmz VPC 的 NAT 网关 + 单一 EIP，dev VPC 通过 TR 出向。
-3. 公网**入向**统一收敛到 dmz VPC 的公网 ALB，后端真实服务器位于 prd VPC，经 TR 反向接入。
-4. NAT EIP 与 ALB EIP 同时纳入**共享带宽包**，集中议价、计费、限速。
-5. 所有资源以 IaC 方式交付，**单一 Provider（volcenginecc）** 即可一键 plan / apply。
-
-***
+本方案通过 Terraform 将上述基础设施标准化、模块化，落地一套**集中式 DMZ-VPC**，帮助用户快速完成统一公网出入口环境的交付。
 
 ## 2. 方案概述
 
-整体方案如下：
+整体采用集中式“公网出入口枢纽”架构：
 
-- **dmz VPC**：唯一对外暴露的 VPC，部署 NAT 网关（出向）与公网 ALB（入向）。
-- **dev VPC**：研发业务 VPC，默认路由 0.0.0.0/0 经 TR 转发到 dmz NAT。
-- **prd VPC**：生产业务 VPC，由 dmz ALB 通过 TR 反向接入提供对外服务。
-- **Transit Router**：中央路由枢纽，三 VPC 各自挂一个 VPC Attachment，专用 TR 子网作为连接点。
-- **共享带宽包**：聚合 NAT EIP 与 ALB 内置 EIP，按总带宽计费。
+- **接入层（入向）**：dmz VPC 内的公网 ALB 承接互联网 HTTP/HTTPS 流量，经 TR 反向转发到 prd 工作负载。
+- **出向层**：dmz VPC 内的公网 NAT 网关 + 单一 EIP 承载统一出向，dev VPC 默认路由经 TR 收敛到此出向。
+- **路由枢纽**：中转路由器 Transit Router 作为中央路由枢纽，dmz / dev / prd 三 VPC 各挂一个 VPC Attachment，专用 TR 子网作为连接点。
+- **工作负载层**：dev / prd 两个业务 VPC 跨可用区部署 ECS，dmz VPC 仅承载出入口组件。
+- **带宽聚合**：NAT EIP 与 ALB 内置 EIP 纳入同一共享带宽包，集中议价、计费、限速。
+- **安全控制**：每 VPC 独立安全组，非 dmz VPC 额外放通 dmz 业务子网网段以支持 ALB 跨 VPC 回源。
 
 ### 架构图
 
@@ -120,8 +112,6 @@ flowchart LR
     bp -.-> note_bp
 ```
 
-***
-
 ## 3. IaC 设计
 
 ### 3.1 资源清单
@@ -152,23 +142,31 @@ flowchart LR
 
 ### 3.2 工程结构
 
+工程采用模块化设计，根模块负责编排与所有涉及 Transit Router 的资源，子模块封装单个 VPC 的网络底座：
+
 ```text
 dmz-vpc/
-├── main.tf                  # 根模块编排：TR + TR 自定义路由表(association/propagation/静态路由) + 3 VPC 模块 + dmz 路由表 + NAT/ALB/ECS + 带宽包
+├── main.tf                  # 根模块编排：TR + TR 自定义路由表(association/propagation/静态默认路由) + 3 TR Attachment(串行) + 3 VPC 模块 + 全部 VPC 路由表 + 安全组 + NAT/ALB/ECS + 带宽包
 ├── variables.tf             # 全局输入变量（含 vpcs 拓扑、TR/NAT/ALB/ECS 配置、安全组规则）
 ├── outputs.tf               # 关键资源输出（TR ID、VPC ID、EIP、ALB DNS、ECS IP 等）
-├── providers.tf             # volcenginecc Provider 配置（仅根模块）
-├── versions.tf              # Terraform >=1.0.7 与 Provider ~>0.0.40 版本约束
+├── providers.tf             # volcenginecc Provider 配置（仅根模块，region 来自变量）
+├── versions.tf              # Terraform >= 1.4.0 与 Provider ~> 0.0.70 版本约束
 ├── locals.tf                # 公共标签 + dmz/dev/prd key 常量
 ├── terraform.tfvars         # 默认变量值（已含 cn-beijing Rocky Linux 9.5 镜像 ID）
 ├── README.md                # 本文档
 └── modules/
-    ├── tr-vpc/              # 单 VPC 模块：VPC + 业务/TR 子网 + 自定义路由表 + TR Attachment
-    │                        # 提供 create_route_table 开关（dmz 设 false 由根模块管路由表）
+    ├── tr-vpc/              # 单 VPC 模块：仅创建 VPC + 业务/TR 子网，并输出 TR 连接点 tr_attach_points
+    │                        # （TR Attachment 与 VPC 路由表统一在根模块创建，以便串行化并打破依赖环）
     ├── nat/                 # NAT 模块：NAT 网关 + 直挂 EIP + SNAT 规则
     ├── alb/                 # ALB 模块：ALB（含自动 EIP）+ 服务器组 + 监听器
     └── ecs/                 # ECS 模块：多 AZ ECS 实例（含 lifecycle.ignore_changes 抑制 Provider drift）
 ```
+
+说明：
+
+- VPC 数量由 `vpcs` 控制，必须包含 `dmz` / `dev` / `prd` 三个 key（变量校验）；每 VPC 子网数量由 `business_subnet_cidrs` / `tr_subnet_cidrs` 与 `zones` 控制。
+- ECS 数量由 `ecs_config.instances_per_subnet` 控制（dev / prd 每业务子网各若干台），设为 `0` 可只创建网络底座。
+- 涉及 Transit Router 的资源（Attachment、association、propagation、TR 路由表、静态默认路由）均在根模块按固定顺序 `dmz → dev → prd` **串行**创建。
 
 ### 3.3 核心代码片段
 
@@ -183,7 +181,7 @@ resource "volcenginecc_transitrouter_transit_router" "main" {
   tags                = local.common_tags_list
 }
 
-# 三 VPC（dmz / dev / prd）批量创建；dmz 不在子模块创建路由表
+# 三 VPC（dmz / dev / prd）批量创建网络底座（仅 VPC + 子网）
 module "vpcs" {
   source   = "./modules/tr-vpc"
   for_each = var.vpcs
@@ -193,13 +191,10 @@ module "vpcs" {
   business_subnet_cidrs = each.value.business_subnet_cidrs
   tr_subnet_cidrs       = each.value.tr_subnet_cidrs
   zones                 = var.zones
-  outbound              = each.value.outbound
-  transit_router_id     = volcenginecc_transitrouter_transit_router.main.transit_router_id
-  create_route_table    = each.key != local.dmz_key   # dmz 由根模块管路由表
   tags                  = local.common_tags_list
 }
 
-# dmz 路由表：0.0.0.0/0 → NAT、dev/prd CIDR → TR（依赖 NAT 与 TR Attachment）
+# dmz 路由表：0.0.0.0/0 → NAT、dev/prd CIDR → TR（依赖 NAT 与 dmz Attachment）
 resource "volcenginecc_vpc_route_table" "dmz" {
   vpc_id     = module.vpcs[local.dmz_key].vpc_id
   subnet_ids = module.vpcs[local.dmz_key].business_subnet_ids
@@ -209,7 +204,7 @@ resource "volcenginecc_vpc_route_table" "dmz" {
     next_hop_id            = e.next_hop_id
     description            = e.description
   }]
-  depends_on = [module.vpcs]
+  depends_on = [volcenginecc_transitrouter_vpc_attachment.dmz]
 }
 
 # 共享带宽包：聚合 NAT EIP 与 ALB 自动创建的 EIP
@@ -226,70 +221,52 @@ resource "volcenginecc_vpc_bandwidth_package" "shared" {
 }
 ```
 
-子模块 `modules/tr-vpc/main.tf` 关键片段：
+子模块 `modules/tr-vpc/main.tf` 只负责 VPC + 子网（TR Attachment 与路由表统一在根模块创建，以便串行化并打破依赖环）：
 
 ```hcl
-resource "volcenginecc_vpc_route_table" "this" {
-  count      = var.create_route_table ? 1 : 0
-  vpc_id     = volcenginecc_vpc_vpc.this.id
-  subnet_ids = [for s in volcenginecc_vpc_subnet.business : s.id]
-  custom_route_entries = [for entry in local.custom_route_entries : {
-    destination_cidr_block = entry.destination_cidr_block
-    next_hop_type          = entry.next_hop_type
-    next_hop_id            = entry.next_hop_id
-    description            = entry.description
-  }]
-  # 路由条目里 TransitRouter 下一跳要求 VPC Attachment 已存在
-  depends_on = [volcenginecc_transitrouter_vpc_attachment.this]
+resource "volcenginecc_vpc_vpc" "this" {
+  vpc_name   = var.vpc_name
+  cidr_block = var.cidr_block
 }
 
-resource "volcenginecc_transitrouter_vpc_attachment" "this" {
-  transit_router_id          = var.transit_router_id
-  vpc_id                     = volcenginecc_vpc_vpc.this.id
-  auto_publish_route_enabled = true
-  attach_points = [
-    for s in volcenginecc_vpc_subnet.tr : { subnet_id = s.id, zone_id = s.zone_id }
-  ]
+resource "volcenginecc_vpc_subnet" "business" {
+  for_each = local.business_subnets
+  vpc_id   = volcenginecc_vpc_vpc.this.id
+  ...
+}
+
+resource "volcenginecc_vpc_subnet" "tr" {
+  for_each = local.tr_subnets
+  vpc_id   = volcenginecc_vpc_vpc.this.id
+  ...
+}
+
+# 供根模块创建 Attachment 使用的连接点（subnet_id + zone_id）
+output "tr_attach_points" {
+  value = [for s in volcenginecc_vpc_subnet.tr : { subnet_id = s.id, zone_id = s.zone_id }]
 }
 ```
 
-> ⚠️ **重要**：在 volcenginecc（Cloud-Control）Provider 下，`auto_publish_route_enabled = true` **并不会真正把各 VPC 的 CIDR 发布进 TR 路由表**，导致跨 VPC（dmz↔prd、dev↔prd）流量在 TR 被黑洞，ALB 健康检查全部异常。因此根模块显式创建一张 **TR 自定义路由表**，并为三个 Attachment 建立 **association（关联）+ propagation（传播）**，再补一条 `0.0.0.0/0 → dmz Attachment` 静态路由用于 dev 统一出向。
-
-根模块 TR 路由表编排（关键修复，节选）：
+根模块 TR Attachment 串行链（关键修复，节选）：
 
 ```hcl
-# TR 自定义路由表
-resource "volcenginecc_transitrouter_transit_router_route_table" "main" {
-  transit_router_id               = volcenginecc_transitrouter_transit_router.main.transit_router_id
-  transit_router_route_table_name = "${var.name_prefix}-tr-rt"
-  description                     = "Custom TR route table interconnecting dmz dev prd VPCs"
-  tags                            = local.common_tags_list
+# 三个 Attachment 串行：dmz → dev → prd
+resource "volcenginecc_transitrouter_vpc_attachment" "dmz" {
+  transit_router_id = volcenginecc_transitrouter_transit_router.main.transit_router_id
+  vpc_id            = module.vpcs["dmz"].vpc_id
+  attach_points     = module.vpcs["dmz"].tr_attach_points
 }
 
-# 三个 VPC Attachment 关联到该路由表
-resource "volcenginecc_transitrouter_transit_router_route_table_association" "this" {
-  for_each                      = var.vpcs
-  transit_router_attachment_id  = module.vpcs[each.key].tr_attachment_id
-  transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+resource "volcenginecc_transitrouter_vpc_attachment" "dev" {
+  # ...
+  attach_points = module.vpcs["dev"].tr_attach_points
+  depends_on    = [volcenginecc_transitrouter_vpc_attachment.dmz]
 }
 
-# 三个 VPC 的 CIDR 传播进该路由表（去程/回程明细路由来源）
-resource "volcenginecc_transitrouter_route_table_propagation" "this" {
-  for_each                      = var.vpcs
-  transit_router_attachment_id  = module.vpcs[each.key].tr_attachment_id
-  transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
-}
-
-# 静态默认路由：dev VPC 经 TR → dmz Attachment → dmz NAT 统一出向
-resource "volcenginecc_transitrouter_transit_router_route_entry" "default_egress" {
-  transit_router_route_table_id            = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
-  destination_cidr_block                   = "0.0.0.0/0"
-  transit_router_route_entry_next_hop_type = "Attachment"
-  transit_router_route_entry_next_hop_id   = module.vpcs[local.dmz_key].tr_attachment_id
-  depends_on = [
-    volcenginecc_transitrouter_transit_router_route_table_association.this,
-    volcenginecc_transitrouter_route_table_propagation.this,
-  ]
+resource "volcenginecc_transitrouter_vpc_attachment" "prd" {
+  # ...
+  attach_points = module.vpcs["prd"].tr_attach_points
+  depends_on    = [volcenginecc_transitrouter_vpc_attachment.dev]
 }
 ```
 
@@ -319,8 +296,6 @@ resource "volcenginecc_ecs_instance" "this" {
 }
 ```
 
-***
-
 ## 4. 使用说明
 
 ### 4.1 环境准备
@@ -339,7 +314,7 @@ resource "volcenginecc_ecs_instance" "this" {
 
 **本地环境**：
 
-1. 安装 Terraform `>= 1.0.7`：
+1. 安装 Terraform `>= 1.4.0`：
    ```bash
    terraform version
    ```
@@ -362,31 +337,57 @@ resource "volcenginecc_ecs_instance" "this" {
    }
    ```
 
-### 4.2 修改变量
+### 4.2 配置变量
 
-打开 [terraform.tfvars](file:///Users/bytedance/Documents/Vibe%20Coding/dmz-vpc/terraform.tfvars) 修改以下关键字段：
+敏感变量不要写入 ` terraform.tfvars` ，建议通过环境变量注入（ECS 登录密码在 `ecs_config` 对象内）：
 
-- `region` / `zones`：目标区域与可用区。
-- `vpcs`：dmz / dev / prd 三个 VPC 的 CIDR、业务/TR 子网；CIDR 设计需要互不重叠。
-- `ecs_config.image_id`：替换为目标区域的实际公共镜像 ID。本工程默认值 `image-yzpyj8j5sl4e0wax4krm` 是 cn-beijing 的 **Rocky Linux 9.5 64 bit**；其他区域请通过 `data "volcenginecc_ecs_image" "x" { id = "image-..." }` 探测。
-- `ecs_config.password`：建议通过 `TF_VAR_ecs_config` 环境变量注入，避免落盘。
-- `nat_eip_bandwidth_mbps` / `alb_eip_bandwidth_mbps` / `shared_bandwidth_package_mbps`：根据业务流量评估；带宽包总量需 ≥ 各 EIP 单值之和。
+```bash
+export TF_VAR_ecs_config='{ image_id = "image-xxxx", password = "<placeholder>" }'
+```
+
+当前示例参数如下。未在 `terraform.tfvars` 中显式填写的参数沿用变量默认值。
+
+| 参数 | 当前示例值 / 默认值 | 说明 |
+| --- | --- | --- |
+| `region` | `cn-beijing` | 部署地域 |
+| `project_name` | `default` | 资源所属项目 |
+| `name_prefix` | `dmz` | 资源名称前缀 |
+| `common_tags` | `Project` / `Environment` / `Owner` / `ManagedBy` | 注入到支持标签的资源 |
+| `zones` | `cn-beijing-a`、`cn-beijing-c` | 可用区列表（至少 2 个，用于多 AZ） |
+| `vpcs` | dmz `172.16/16` / dev `172.17/16` / prd `172.18/16` | 三个 VPC 的 CIDR、业务子网、TR 子网及 `outbound` 开关；CIDR 需互不重叠 |
+| `vpc_internal_route_cidrs` | `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` | 各 VPC 经 TR 互通的 RFC1918 网段 |
+| `tr_config` | `asn = 64512` | 中转路由器名称 / 描述 / ASN |
+| `nat_gateway_spec` | `Small` | dmz NAT 网关规格 |
+| `nat_eip_bandwidth_mbps` | `5` | NAT 出向 EIP 带宽（Mbps） |
+| `alb_eip_bandwidth_mbps` | `5` | ALB 内置 EIP 带宽（Mbps） |
+| `shared_bandwidth_package_mbps` | `10` | 共享带宽包总带宽，需 ≥ 各 EIP 带宽之和 |
+| `alb_config` | `IPv4` / `Standard` / `HTTP` / `80` / `/` | ALB IP 版本、版本、监听协议/端口、健康检查 URI |
+| `ecs_config.image_id` | 示例公共镜像 ID | 必须替换为目标地域可用镜像；默认值为 cn-beijing Rocky Linux 9.5 |
+| `ecs_config.instance_type` | `ecs.g3i.large` | ECS 规格 |
+| `ecs_config.password` | 敏感，必须覆盖 | ECS 登录密码，建议用 `TF_VAR_ecs_config` 注入 |
+| `ecs_config.system_volume_type` | `ESSD_PL0` | ECS 系统盘类型 |
+| `ecs_config.system_volume_size` | `50` | ECS 系统盘容量（GB） |
+| `ecs_config.instances_per_subnet` | `1` | dev / prd 每业务子网的 ECS 数量；设为 `0` 仅建网络底座 |
+| `default_ingress_rules` | 放行 22 / 80 / 443 | 每 VPC 安全组的基线入站规则 |
 
 ### 4.3 一键部署
 
+初始化与校验：
+
 ```bash
 terraform init
+terraform fmt -check -recursive
+terraform validate
+```
+
+部署：
+
+```bash
 terraform plan -out tfplan
 terraform apply tfplan
 ```
 
-> ⚠️ 因 TR 不能同时被多个 VPC Attachment / 路由表 association / propagation 并发操作（API 会返回 `InvalidTransitRouter.InvalidStatus` / `InvalidTransitRouterAttachment.InvalidStatus`），建议第一次 apply 使用 `-parallelism=1` 串行创建，给 TR 留出状态切换时间：
->
-> ```bash
-> terraform apply -parallelism=1 -auto-approve
-> ```
->
-> 若个别 TR 路由 association/propagation 因瞬时状态冲突创建失败，直接重跑一次 `terraform apply` 即可补齐（Terraform 只会补建缺失的资源）。
+> ℹ️ 涉及 Transit Router 的资源已在代码中按 `dmz → dev → prd` 串行创建，**无需手动指定 `-parallelism=1`**，一次 `terraform apply` 即可稳定完成。
 
 ### 4.4 场景化部署示例
 
@@ -408,11 +409,13 @@ ecs_config = {
 默认仅 dev VPC 走 NAT 出向。如果 prd VPC 也需要出向：
 
 1. 把 `vpcs.prd.outbound` 改为 `true`；
-2. 在 [main.tf](file:///Users/bytedance/Documents/Vibe%20Coding/dmz-vpc/main.tf) 的 `module.nat.snat_source_cidrs` 增加 prd CIDR。
+2. 在 [main.tf](file:///opt/test-tf/terraform-volcenginecc-dmz-vpc/main.tf) 的 `module.nat.snat_source_cidrs` 增加 prd CIDR。
 
 #### 场景 C：HTTPS 入向
 
-将 `alb_config.listener_protocol` 改为 `HTTPS`、`listener_port` 改为 `443`，并在 [modules/alb/main.tf](file:///Users/bytedance/Documents/Vibe%20Coding/dmz-vpc/modules/alb/main.tf) 的 `volcenginecc_alb_listener` 资源上增加 `certificate_source = "cert_center"` 与 `cert_center_certificate_id` 等参数（参考火山引擎 ALB 证书中心文档）。
+将 `alb_config.listener_protocol` 改为 `HTTPS`、`listener_port` 改为 `443`，并在 [modules/alb/main.tf](file:///opt/test-tf/terraform-volcenginecc-dmz-vpc/modules/alb/main.tf) 的 `volcenginecc_alb_listener` 资源上增加 `certificate_source = "cert_center"` 与 `cert_center_certificate_id` 等参数（参考火山引擎 ALB 证书中心文档）。
+
+> 关闭功能或减少数量会在下一次执行时**删除**相应资源，而非仅暂停服务。ECS 的规格、密码、镜像、主网卡和系统盘配置被生命周期规则忽略，修改这些参数不会自动更新已有实例，应先评估替换方案。
 
 ### 4.5 部署预期结果
 
@@ -467,13 +470,19 @@ terraform output vpc_route_table_ids               # dmz/dev/prd 三张 VPC 路�
 terraform show -json | ...                          # 解析 custom_route_entries / propagation / association 状态
 ```
 
-> 说明：早期版本依赖 Attachment 的 `auto_publish_route_enabled=true` 自动学习并要求 apply 后手动补 `0.0.0.0/0`；实测该参数在 volcenginecc Provider 下不生效，已改为上述显式 TR 路由表方案，手动步骤已废弃。
+
 
 ### 4.7 销毁资源
 
 ```bash
-terraform destroy -auto-approve -parallelism=1
+terraform destroy -auto-approve
 ```
+
+> ℹ️ 创建侧的 TR 操作已在代码中串行化，销毁时 Terraform 会按反向依赖链逐个删除 TR 资源，一般无需 `-parallelism=1`。若在某些环境下销毁 TR Attachment/association/propagation 仍偶发 `InvalidStatus`，可追加 `-parallelism=1` 后重跑：
+>
+> ```bash
+> terraform destroy -auto-approve -parallelism=1
+> ```
 
 > ⚠️ 销毁会按依赖顺序删除：ALB 监听器/服务器组 → ALB → 共享带宽包 → ECS → SNAT → NAT EIP → NAT → 安全组 → 路由表 → TR Attachment → 子网 → VPC → TR。务必先把 ALB 上的业务流量切走再 destroy。
 
@@ -485,20 +494,21 @@ terraform destroy -auto-approve -parallelism=1
 >
 > <br />
 
-***
-
 ## 5. 总结
 
-本工程具备以下优势：
+本方案的主要优势：
 
-1. **模块清晰**：按"网络底座 / 出向 / 入向 / 工作负载"拆分为 4 个独立模块（`tr-vpc / nat / alb / ecs`），便于复用与独立升级；dmz 路由表通过模块开关 `create_route_table=false` 提取到根模块以打破循环依赖。
-2. **集中治理**：跨 VPC 路由集中在 TR 自定义路由表（association + propagation + 静态默认路由，声明式全托管）、安全组规则集中在根模块编排、EIP 集中纳入共享带宽包，符合 Landing Zone "集中式治理"的最佳实践。
-3. **多 AZ HA**：所有子网（业务子网 + TR 子网）默认跨 AZ 分布；ALB 跨 AZ 部署；ECS 跨子网创建，原生支持高可用。
+- **标准化交付**：通过 Terraform 统一创建网络、路由、公网出向、公网入向、带宽聚合与工作负载资源，一键 `terraform apply` 即可完成集中式公网出入口环境的交付。
+- **集中治理**：跨 VPC 路由集中在 TR 自定义路由表（association + propagation + 静态默认路由，声明式全托管），安全组规则集中在根模块编排，NAT EIP 与 ALB EIP 集中纳入共享带宽包，符合 Landing Zone“集中式治理”的最佳实践。
+- **稳定创建**：所有涉及 Transit Router 的资源在根模块按 `dmz → dev → prd` 串行创建，规避 TR 并发操作导致的 `InvalidStatus`，无需手动 `-parallelism=1`；dmz / dev / prd 的 VPC 路由表统一在根模块创建以打破模块与 Attachment 之间的依赖环。
+- **多 AZ 高可用**：所有子网（业务子网 + TR 子网）默认跨 AZ 分布，ALB 跨 AZ 部署，ECS 跨子网创建，原生支持高可用。
+- **模块化复用**：按 `tr-vpc`（网络底座）/ `nat`（出向）/ `alb`（入向）/ `ecs`（工作负载）拆分模块，便于按需组合与独立升级。
 
-**未来可在此方案上扩展**：
+未来可继续扩展：
 
 - 接入 **`volcenginecc_apig_gateway`** 替换 ALB，提供更完整的网关能力（认证、限流、灰度）。
 - 集成 **`volcenginecc_waf_domain`** 做入向 WAF 防护，统一在 dmz VPC 落地。
 - 接入 **`volcenginecc_iam_role`** + 最小权限策略，让 Terraform 执行账号仅持有必要权限。
 - 启用 **`volcenginecc_vpc_flow_log`** 做 TR / VPC 流量审计，与 CLS / Prometheus 联动。
+- 接入远端 Backend 管理 Terraform State，支持团队协作与 CI/CD 流水线。
 

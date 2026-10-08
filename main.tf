@@ -37,14 +37,65 @@ module "vpcs" {
   business_subnet_cidrs = each.value.business_subnet_cidrs
   tr_subnet_cidrs       = each.value.tr_subnet_cidrs
   zones                 = var.zones
-  outbound              = each.value.outbound
-  internal_route_cidrs  = var.vpc_internal_route_cidrs
-  transit_router_id     = volcenginecc_transitrouter_transit_router.main.transit_router_id
-  # The dmz VPC route table is built at the root level because it must
-  # reference the NAT gateway created later in this configuration.
-  create_route_table = each.key != local.dmz_key
-  project_name       = var.project_name
-  tags               = local.common_tags_list
+  project_name          = var.project_name
+  tags                  = local.common_tags_list
+}
+
+# ---------------------------------------------------------------------------
+# TR VPC Attachments – created at the root level and chained dmz -> dev -> prd
+# so that only one attach operation hits the Transit Router at a time. The TR
+# rejects concurrent attach / route-table operations with
+# InvalidTransitRouterAttachment.InvalidStatus / InvalidTransitRouter.
+# InvalidStatus, which previously forced `terraform apply -parallelism=1`.
+#
+# The three attachments are declared as separate resources (rather than
+# for_each/count) so each can explicitly depend_on the previous one, forming a
+# strict dmz -> dev -> prd chain that Terraform will never run concurrently.
+# ---------------------------------------------------------------------------
+resource "volcenginecc_transitrouter_vpc_attachment" "dmz" {
+  transit_router_id              = volcenginecc_transitrouter_transit_router.main.transit_router_id
+  vpc_id                         = module.vpcs[local.dmz_key].vpc_id
+  transit_router_attachment_name = "${var.name_prefix}-${local.dmz_key}-attach"
+  description                    = "Attachment between TR and ${var.name_prefix}-${local.dmz_key}"
+  auto_publish_route_enabled     = true
+  attach_points                  = module.vpcs[local.dmz_key].tr_attach_points
+  tags                           = local.common_tags_list
+}
+
+resource "volcenginecc_transitrouter_vpc_attachment" "dev" {
+  transit_router_id              = volcenginecc_transitrouter_transit_router.main.transit_router_id
+  vpc_id                         = module.vpcs[local.dev_key].vpc_id
+  transit_router_attachment_name = "${var.name_prefix}-${local.dev_key}-attach"
+  description                    = "Attachment between TR and ${var.name_prefix}-${local.dev_key}"
+  auto_publish_route_enabled     = true
+  attach_points                  = module.vpcs[local.dev_key].tr_attach_points
+  tags                           = local.common_tags_list
+
+  # Wait for the dmz attachment so only one attach hits the TR at a time.
+  depends_on = [volcenginecc_transitrouter_vpc_attachment.dmz]
+}
+
+resource "volcenginecc_transitrouter_vpc_attachment" "prd" {
+  transit_router_id              = volcenginecc_transitrouter_transit_router.main.transit_router_id
+  vpc_id                         = module.vpcs[local.prd_key].vpc_id
+  transit_router_attachment_name = "${var.name_prefix}-${local.prd_key}-attach"
+  description                    = "Attachment between TR and ${var.name_prefix}-${local.prd_key}"
+  auto_publish_route_enabled     = true
+  attach_points                  = module.vpcs[local.prd_key].tr_attach_points
+  tags                           = local.common_tags_list
+
+  # Wait for the dev attachment to keep the dmz -> dev -> prd chain serial.
+  depends_on = [volcenginecc_transitrouter_vpc_attachment.dev]
+}
+
+# Map each VPC key to its attachment ID so associations / propagations / route
+# tables can look attachments up by key.
+locals {
+  tr_attachment_id_by_key = {
+    (local.dmz_key) = volcenginecc_transitrouter_vpc_attachment.dmz.transit_router_attachment_id
+    (local.dev_key) = volcenginecc_transitrouter_vpc_attachment.dev.transit_router_attachment_id
+    (local.prd_key) = volcenginecc_transitrouter_vpc_attachment.prd.transit_router_attachment_id
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -70,21 +121,54 @@ resource "volcenginecc_transitrouter_transit_router_route_table" "main" {
 
 # Associate every VPC attachment with the custom TR route table so that traffic
 # entering the TR from any VPC is looked up against a table that knows all VPCs.
-resource "volcenginecc_transitrouter_transit_router_route_table_association" "this" {
-  for_each = var.vpcs
-
-  transit_router_attachment_id  = module.vpcs[each.key].tr_attachment_id
+#
+# Associations and propagations all mutate the same TR route table and must not
+# run concurrently (InvalidTransitRouter.InvalidStatus). They are therefore
+# declared as separate, explicitly chained resources in a fixed order:
+#   assoc dmz -> assoc dev -> assoc prd -> prop dmz -> prop dev -> prop prd
+# This removes the need for `terraform apply -parallelism=1`.
+resource "volcenginecc_transitrouter_transit_router_route_table_association" "dmz" {
+  transit_router_attachment_id  = local.tr_attachment_id_by_key[local.dmz_key]
   transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+}
+
+resource "volcenginecc_transitrouter_transit_router_route_table_association" "dev" {
+  transit_router_attachment_id  = local.tr_attachment_id_by_key[local.dev_key]
+  transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+
+  depends_on = [volcenginecc_transitrouter_transit_router_route_table_association.dmz]
+}
+
+resource "volcenginecc_transitrouter_transit_router_route_table_association" "prd" {
+  transit_router_attachment_id  = local.tr_attachment_id_by_key[local.prd_key]
+  transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+
+  depends_on = [volcenginecc_transitrouter_transit_router_route_table_association.dev]
 }
 
 # Propagate every VPC attachment into the custom TR route table so each VPC's
 # CIDR is installed as a route pointing back at its attachment. This is what was
-# missing and caused the ALB health checks / cross-VPC pings to fail.
-resource "volcenginecc_transitrouter_route_table_propagation" "this" {
-  for_each = var.vpcs
-
-  transit_router_attachment_id  = module.vpcs[each.key].tr_attachment_id
+# missing and caused the ALB health checks / cross-VPC pings to fail. The
+# propagations run after all associations, still strictly one at a time.
+resource "volcenginecc_transitrouter_route_table_propagation" "dmz" {
+  transit_router_attachment_id  = local.tr_attachment_id_by_key[local.dmz_key]
   transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+
+  depends_on = [volcenginecc_transitrouter_transit_router_route_table_association.prd]
+}
+
+resource "volcenginecc_transitrouter_route_table_propagation" "dev" {
+  transit_router_attachment_id  = local.tr_attachment_id_by_key[local.dev_key]
+  transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+
+  depends_on = [volcenginecc_transitrouter_route_table_propagation.dmz]
+}
+
+resource "volcenginecc_transitrouter_route_table_propagation" "prd" {
+  transit_router_attachment_id  = local.tr_attachment_id_by_key[local.prd_key]
+  transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+
+  depends_on = [volcenginecc_transitrouter_route_table_propagation.dev]
 }
 
 # ---------------------------------------------------------------------------
@@ -209,9 +293,64 @@ resource "volcenginecc_vpc_route_table" "dmz" {
 
   tags = local.common_tags_list
 
-  # Routes that reference the Transit Router require its VPC attachment to
+  # Routes that reference the Transit Router require the dmz VPC attachment to
   # exist beforehand, otherwise the API rejects the entries.
-  depends_on = [module.vpcs]
+  depends_on = [volcenginecc_transitrouter_vpc_attachment.dmz]
+}
+
+# ---------------------------------------------------------------------------
+# dev / prd VPC route tables – also managed at the root level (previously built
+# inside the tr-vpc module). Keeping them here avoids a dependency cycle: the
+# route tables need the TR attachment ID, and the attachments need the module's
+# subnets. All non-dmz VPCs forward RFC1918 traffic (and, when outbound = true,
+# the default route) to the Transit Router.
+# ---------------------------------------------------------------------------
+locals {
+  non_dmz_route_entries = {
+    for k, v in var.vpcs : k => concat(
+      [
+        for cidr in var.vpc_internal_route_cidrs : {
+          destination_cidr_block = cidr
+          next_hop_type          = "TransitRouter"
+          next_hop_id            = volcenginecc_transitrouter_transit_router.main.transit_router_id
+          description            = "RFC1918 traffic via Transit Router"
+        }
+      ],
+      v.outbound ? [{
+        destination_cidr_block = "0.0.0.0/0"
+        next_hop_type          = "TransitRouter"
+        next_hop_id            = volcenginecc_transitrouter_transit_router.main.transit_router_id
+        description            = "Default route via Transit Router for unified egress through dmz NAT"
+      }] : [],
+    ) if k != local.dmz_key
+  }
+}
+
+resource "volcenginecc_vpc_route_table" "non_dmz" {
+  for_each = local.non_dmz_route_entries
+
+  vpc_id           = module.vpcs[each.key].vpc_id
+  route_table_name = "${var.name_prefix}-${each.key}-rt"
+  description      = "Custom route table for ${each.key} VPC"
+  project_name     = var.project_name
+  subnet_ids       = module.vpcs[each.key].business_subnet_ids
+
+  custom_route_entries = [
+    for entry in each.value : {
+      destination_cidr_block = entry.destination_cidr_block
+      next_hop_type          = entry.next_hop_type
+      next_hop_id            = entry.next_hop_id
+      description            = entry.description
+    }
+  ]
+
+  tags = local.common_tags_list
+
+  # TransitRouter next hops require this VPC's attachment to exist first.
+  depends_on = [
+    volcenginecc_transitrouter_vpc_attachment.dev,
+    volcenginecc_transitrouter_vpc_attachment.prd,
+  ]
 }
 
 # ---------------------------------------------------------------------------
@@ -310,13 +449,14 @@ resource "volcenginecc_transitrouter_transit_router_route_entry" "default_egress
   transit_router_route_table_id            = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
   destination_cidr_block                   = "0.0.0.0/0"
   transit_router_route_entry_next_hop_type = "Attachment"
-  transit_router_route_entry_next_hop_id   = module.vpcs[local.dmz_key].tr_attachment_id
+  transit_router_route_entry_next_hop_id   = local.tr_attachment_id_by_key[local.dmz_key]
   transit_router_route_entry_name          = "${var.name_prefix}-tr-default-egress"
   description                              = "Default route to dmz attachment for unified NAT egress"
 
   # The next-hop attachment must already be associated/propagated in the table.
+  # Depend on the last link of the association/propagation chain so this static
+  # route is created only after the whole table has settled.
   depends_on = [
-    volcenginecc_transitrouter_transit_router_route_table_association.this,
-    volcenginecc_transitrouter_route_table_propagation.this,
+    volcenginecc_transitrouter_route_table_propagation.prd,
   ]
 }

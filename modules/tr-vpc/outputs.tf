@@ -28,12 +28,12 @@ output "tr_subnet_ids" {
   value       = [for k in sort(keys(volcenginecc_vpc_subnet.tr)) : volcenginecc_vpc_subnet.tr[k].id]
 }
 
-output "route_table_id" {
-  description = "ID of the custom route table associated with the VPC (null if create_route_table = false)."
-  value       = try(volcenginecc_vpc_route_table.this[0].id, null)
-}
-
-output "tr_attachment_id" {
-  description = "ID of the TR VPC attachment."
-  value       = volcenginecc_transitrouter_vpc_attachment.this.transit_router_attachment_id
+output "tr_attach_points" {
+  description = "Ordered list of { subnet_id, zone_id } connection points for the TR VPC attachment (created in the root module)."
+  value = [
+    for k in sort(keys(volcenginecc_vpc_subnet.tr)) : {
+      subnet_id = volcenginecc_vpc_subnet.tr[k].id
+      zone_id   = volcenginecc_vpc_subnet.tr[k].zone_id
+    }
+  ]
 }

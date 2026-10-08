@@ -20,14 +20,14 @@ output "vpc_ids" {
 output "vpc_route_table_ids" {
   description = "Map of VPC alias → custom route table ID."
   value = merge(
-    { for k, m in module.vpcs : k => m.route_table_id if m.route_table_id != null },
+    { for k, rt in volcenginecc_vpc_route_table.non_dmz : k => rt.id },
     { (local.dmz_key) = volcenginecc_vpc_route_table.dmz.id },
   )
 }
 
 output "tr_attachment_ids" {
   description = "Map of VPC alias → Transit Router VPC attachment ID."
-  value       = { for k, m in module.vpcs : k => m.tr_attachment_id }
+  value       = local.tr_attachment_id_by_key
 }
 
 output "security_group_ids" {
