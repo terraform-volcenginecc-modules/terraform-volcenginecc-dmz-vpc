@@ -478,7 +478,7 @@ terraform show -json | ...                          # 解析 custom_route_entrie
 terraform destroy -auto-approve
 ```
 
-> ℹ️ 创建侧的 TR 操作已在代码中串行化，销毁时 Terraform 会按反向依赖链逐个删除 TR 资源，一般无需 `-parallelism=1`。若在某些环境下销毁 TR Attachment/association/propagation 仍偶发 `InvalidStatus`，可追加 `-parallelism=1` 后重跑：
+> ℹ️ 创建侧的 TR 操作已在代码中串行化，销毁时 Terraform 会按反向依赖链逐个删除 TR 资源。此外工程在 TR 资源之间插入了两个 `time_sleep`（仅 `destroy_duration = "10s"`，不影响 apply）：销毁时「assoc/propagation 删完 → 等 10s → 删 TR 路由表 → 等 10s → 删 TR Attachment」，给 TR 状态机留出收敛时间，规避 `InvalidTransitRouter.InvalidStatus`。因此一般无需 `-parallelism=1`。若在个别环境下仍偶发 `InvalidStatus`，可追加 `-parallelism=1` 后重跑：
 >
 > ```bash
 > terraform destroy -auto-approve -parallelism=1

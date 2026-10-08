@@ -99,6 +99,26 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
+# Serialization wait #2 – let the Transit Router settle AFTER all three VPC
+# attachments are created and BEFORE the TR route table is created.
+#
+# Only `destroy_duration` is set, so apply is NOT slowed down. On destroy the
+# dependency reverses: the TR route table is deleted first, then this resource
+# waits 10s (giving the TR time to leave its transient state) before the three
+# attachments are deleted – avoiding InvalidTransitRouterAttachment.InvalidStatus
+# / InvalidTransitRouter.InvalidStatus during teardown.
+# ---------------------------------------------------------------------------
+resource "time_sleep" "after_attachments" {
+  destroy_duration = "10s"
+
+  depends_on = [
+    volcenginecc_transitrouter_vpc_attachment.dmz,
+    volcenginecc_transitrouter_vpc_attachment.dev,
+    volcenginecc_transitrouter_vpc_attachment.prd,
+  ]
+}
+
+# ---------------------------------------------------------------------------
 # Transit Router route table + associations + propagations.
 #
 # The volcenginecc (Cloud-Control) provider does NOT actually publish VPC CIDRs
@@ -117,6 +137,25 @@ resource "volcenginecc_transitrouter_transit_router_route_table" "main" {
   transit_router_route_table_name = "${var.name_prefix}-tr-rt"
   description                     = "Custom TR route table interconnecting dmz dev prd VPCs"
   tags                            = local.common_tags_list
+
+  # Created after the attachments settle; on destroy this table is removed
+  # before the attachments (which then wait via time_sleep.after_attachments).
+  depends_on = [time_sleep.after_attachments]
+}
+
+# ---------------------------------------------------------------------------
+# Serialization wait #1 – let the Transit Router / route table settle AFTER the
+# route table is created and BEFORE associations/propagations are created.
+#
+# On destroy the dependency reverses: all associations/propagations are deleted
+# first, then this resource waits 10s before the TR route table is deleted –
+# this is exactly the step that previously failed with
+# InvalidTransitRouter.InvalidStatus during teardown.
+# ---------------------------------------------------------------------------
+resource "time_sleep" "after_tr_route_table" {
+  destroy_duration = "10s"
+
+  depends_on = [volcenginecc_transitrouter_transit_router_route_table.main]
 }
 
 # Associate every VPC attachment with the custom TR route table so that traffic
@@ -130,6 +169,8 @@ resource "volcenginecc_transitrouter_transit_router_route_table" "main" {
 resource "volcenginecc_transitrouter_transit_router_route_table_association" "dmz" {
   transit_router_attachment_id  = local.tr_attachment_id_by_key[local.dmz_key]
   transit_router_route_table_id = volcenginecc_transitrouter_transit_router_route_table.main.transit_router_route_table_id
+
+  depends_on = [time_sleep.after_tr_route_table]
 }
 
 resource "volcenginecc_transitrouter_transit_router_route_table_association" "dev" {
