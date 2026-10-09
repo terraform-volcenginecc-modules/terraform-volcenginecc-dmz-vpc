@@ -38,7 +38,7 @@ vpcs = {
 nat_gateway_spec              = "Small"
 nat_eip_bandwidth_mbps        = 5
 alb_eip_bandwidth_mbps        = 5
-shared_bandwidth_package_mbps = 10
+shared_bandwidth_package_mbps = 15
 
 alb_config = {
   address_ip_version = "IPv4"

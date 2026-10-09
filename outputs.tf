@@ -56,8 +56,13 @@ output "alb_dns_name" {
 }
 
 output "alb_eip_address" {
-  description = "Public IPv4 address of the ALB EIP."
+  description = "First public IPv4 address of the ALB EIPs."
   value       = module.alb.alb_eip_address
+}
+
+output "alb_eip_addresses" {
+  description = "Public IPv4 addresses of all ALB EIPs."
+  value       = module.alb.alb_eip_addresses
 }
 
 output "shared_bandwidth_package_id" {

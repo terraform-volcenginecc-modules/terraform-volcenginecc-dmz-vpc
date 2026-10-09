@@ -38,6 +38,12 @@ resource "volcenginecc_alb_load_balancer" "this" {
   tags = var.tags
 }
 
+# The resource schema only exposes the configured zone and subnet IDs. Read
+# the completed ALB through its data source to obtain the EIPs created per AZ.
+data "volcenginecc_alb_load_balancer" "this" {
+  id = volcenginecc_alb_load_balancer.this.id
+}
+
 # Server group – IP-based backends so the ALB can target ECS instances that
 # may sit in a different VPC (prd VPC, reachable via the Transit Router).
 resource "volcenginecc_alb_server_group" "this" {

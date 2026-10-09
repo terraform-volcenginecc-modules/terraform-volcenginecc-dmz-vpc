@@ -472,7 +472,9 @@ resource "volcenginecc_vpc_bandwidth_package" "shared" {
 
   eip_addresses = concat(
     [{ allocation_id = module.nat.eip_id }],
-    module.alb.alb_eip_allocation_id == null ? [] : [{ allocation_id = module.alb.alb_eip_allocation_id }],
+    [for allocation_id in module.alb.alb_eip_allocation_ids : {
+      allocation_id = allocation_id
+    }],
   )
 
   tags = local.common_tags_list

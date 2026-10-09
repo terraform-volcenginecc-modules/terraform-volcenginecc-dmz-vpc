@@ -18,27 +18,37 @@ output "listener_id" {
   value       = volcenginecc_alb_listener.this.id
 }
 
-# The ALB-managed EIP allocation – used to register the ALB EIP into the
-# shared bandwidth package alongside the NAT EIP. zone_mappings is a Set so
-# we flatten and pick the first entry.
+locals {
+  alb_eip_allocation_ids = distinct(flatten([
+    for zm in data.volcenginecc_alb_load_balancer.this.zone_mappings : [
+      for addr in zm.load_balancer_addresses : addr.eip_id
+    ]
+  ]))
+
+  alb_eip_addresses = distinct(flatten([
+    for zm in data.volcenginecc_alb_load_balancer.this.zone_mappings : [
+      for addr in zm.load_balancer_addresses : addr.eip_address
+    ]
+  ]))
+}
+
+output "alb_eip_allocation_ids" {
+  description = "Allocation IDs of all EIPs automatically attached to the ALB."
+  value       = local.alb_eip_allocation_ids
+}
+
+output "alb_eip_addresses" {
+  description = "Public IPv4 addresses of all EIPs automatically attached to the ALB."
+  value       = local.alb_eip_addresses
+}
+
+# Compatibility outputs for callers that still expect one ALB EIP.
 output "alb_eip_allocation_id" {
-  description = "Allocation ID of the EIP automatically attached to the ALB."
-  value = try(
-    [
-      for zm in tolist(volcenginecc_alb_load_balancer.this.zone_mappings) :
-      [for addr in tolist(zm.load_balancer_addresses) : addr.eip_id][0]
-    ][0],
-    null,
-  )
+  description = "First allocation ID of the EIPs automatically attached to the ALB."
+  value       = try(local.alb_eip_allocation_ids[0], null)
 }
 
 output "alb_eip_address" {
-  description = "Public IPv4 address of the ALB EIP."
-  value = try(
-    [
-      for zm in tolist(volcenginecc_alb_load_balancer.this.zone_mappings) :
-      [for addr in tolist(zm.load_balancer_addresses) : addr.eip_address][0]
-    ][0],
-    null,
-  )
+  description = "First public IPv4 address of the EIPs automatically attached to the ALB."
+  value       = try(local.alb_eip_addresses[0], null)
 }
