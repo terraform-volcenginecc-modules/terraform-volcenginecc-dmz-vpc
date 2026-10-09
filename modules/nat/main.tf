@@ -21,6 +21,14 @@ resource "volcenginecc_natgateway_ngw" "this" {
   tags             = var.tags
 }
 
+# Let the NAT control plane observe the EIP as fully detached before deleting
+# the gateway. With destroy-only timing, this does not delay creation.
+resource "time_sleep" "before_nat_gateway_destroy" {
+  destroy_duration = "30s"
+
+  depends_on = [volcenginecc_natgateway_ngw.this]
+}
+
 # EIP for NAT – pay-as-you-go BGP. Bound directly to the NAT gateway via
 # instance_id/instance_type, which replaces the legacy
 # `volcengine_eip_associate` resource used in the original landing-zone code.
@@ -35,6 +43,8 @@ resource "volcenginecc_vpc_eip" "nat" {
   instance_type        = "Nat"
   bandwidth_package_id = var.bandwidth_package_id
   tags                 = var.tags
+
+  depends_on = [time_sleep.before_nat_gateway_destroy]
 }
 
 # SNAT entries – one per upstream CIDR. Traffic from each source CIDR is

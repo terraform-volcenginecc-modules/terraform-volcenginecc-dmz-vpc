@@ -41,6 +41,15 @@ module "vpcs" {
   tags                  = local.common_tags_list
 }
 
+# Allow service-managed and primary ENIs to disappear before Terraform removes
+# their subnets. All subnet consumers depend on this destroy-only barrier, so
+# teardown reverses to consumers -> sleep 30s -> subnets.
+resource "time_sleep" "before_subnet_destroy" {
+  destroy_duration = "30s"
+
+  depends_on = [module.vpcs]
+}
+
 # ---------------------------------------------------------------------------
 # TR VPC Attachments – created at the root level and chained dmz -> dev -> prd
 # so that only one attach operation hits the Transit Router at a time. The TR
@@ -60,6 +69,15 @@ resource "volcenginecc_transitrouter_vpc_attachment" "dmz" {
   auto_publish_route_enabled     = true
   attach_points                  = module.vpcs[local.dmz_key].tr_attach_points
   tags                           = local.common_tags_list
+
+  depends_on = [time_sleep.before_subnet_destroy]
+}
+
+# On destroy, wait after the dev attachment is removed before removing dmz.
+resource "time_sleep" "after_dmz_attachment" {
+  destroy_duration = "10s"
+
+  depends_on = [volcenginecc_transitrouter_vpc_attachment.dmz]
 }
 
 resource "volcenginecc_transitrouter_vpc_attachment" "dev" {
@@ -71,8 +89,15 @@ resource "volcenginecc_transitrouter_vpc_attachment" "dev" {
   attach_points                  = module.vpcs[local.dev_key].tr_attach_points
   tags                           = local.common_tags_list
 
-  # Wait for the dmz attachment so only one attach hits the TR at a time.
-  depends_on = [volcenginecc_transitrouter_vpc_attachment.dmz]
+  # Serialize create and leave a settle interval between deletes.
+  depends_on = [time_sleep.after_dmz_attachment]
+}
+
+# On destroy, wait after the prd attachment is removed before removing dev.
+resource "time_sleep" "after_dev_attachment" {
+  destroy_duration = "10s"
+
+  depends_on = [volcenginecc_transitrouter_vpc_attachment.dev]
 }
 
 resource "volcenginecc_transitrouter_vpc_attachment" "prd" {
@@ -84,8 +109,9 @@ resource "volcenginecc_transitrouter_vpc_attachment" "prd" {
   attach_points                  = module.vpcs[local.prd_key].tr_attach_points
   tags                           = local.common_tags_list
 
-  # Wait for the dev attachment to keep the dmz -> dev -> prd chain serial.
-  depends_on = [volcenginecc_transitrouter_vpc_attachment.dev]
+  # Keep the dmz -> dev -> prd create chain serial and the reverse destroy
+  # chain separated by time_sleep.after_dev_attachment.
+  depends_on = [time_sleep.after_dev_attachment]
 }
 
 # Map each VPC key to its attachment ID so associations / propagations / route
@@ -264,6 +290,15 @@ resource "volcenginecc_vpc_security_group" "this" {
   tags = local.common_tags_list
 }
 
+# Let ECS primary ENIs reach a stable deleted state before their security
+# groups are removed. With destroy-only timing, apply is not delayed:
+# security groups -> sleep -> ECS becomes ECS -> sleep 30s -> security groups.
+resource "time_sleep" "before_security_group_destroy" {
+  destroy_duration = "30s"
+
+  depends_on = [volcenginecc_vpc_security_group.this]
+}
+
 # ---------------------------------------------------------------------------
 # Public NAT Gateway in dmz VPC – unified public egress for the landing zone.
 # The dev VPC's CIDR is registered as a SNAT source so its workloads can reach
@@ -282,6 +317,8 @@ module "nat" {
   snat_source_cidrs  = [var.vpcs[local.dev_key].cidr_block]
   project_name       = var.project_name
   tags               = local.common_tags_list
+
+  depends_on = [time_sleep.before_subnet_destroy]
 }
 
 # ---------------------------------------------------------------------------
@@ -413,6 +450,11 @@ module "ecs_dev" {
   instances_per_subnet = var.ecs_config.instances_per_subnet
   project_name         = var.project_name
   tags                 = local.common_tags_list
+
+  depends_on = [
+    time_sleep.before_security_group_destroy,
+    time_sleep.before_subnet_destroy,
+  ]
 }
 
 module "ecs_prd" {
@@ -430,6 +472,11 @@ module "ecs_prd" {
   instances_per_subnet = var.ecs_config.instances_per_subnet
   project_name         = var.project_name
   tags                 = local.common_tags_list
+
+  depends_on = [
+    time_sleep.before_security_group_destroy,
+    time_sleep.before_subnet_destroy,
+  ]
 }
 
 # ---------------------------------------------------------------------------
@@ -455,6 +502,8 @@ module "alb" {
   backend_ips        = module.ecs_prd.private_ip_list
   project_name       = var.project_name
   tags               = local.common_tags_list
+
+  depends_on = [time_sleep.before_subnet_destroy]
 }
 
 # ---------------------------------------------------------------------------

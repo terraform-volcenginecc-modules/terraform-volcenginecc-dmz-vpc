@@ -1,6 +1,6 @@
 # DMZ-VPC 统一公网出入口 Landing Zone
 
-在火山引擎上部署一套集中式的公网出入口 Landing Zone，覆盖网络、路由、公网出向（NAT）、公网入向（ALB）、带宽聚合与工作负载等核心资源。该方案基于**单一 `volcenginecc` Provider**，通过中转路由器 Transit Router 将 dmz / dev / prd 三个 VPC 组成星型拓扑，把公网出向收敛到 dmz NAT、公网入向收敛到 dmz 公网 ALB，并将 NAT EIP 与 ALB EIP 纳入共享带宽包，一键 `terraform apply` 即可完成交付。
+在火山引擎上部署一套集中式的公网出入口 Landing Zone，覆盖网络、路由、公网出向（NAT）、公网入向（ALB）、带宽聚合与工作负载等核心资源。该方案的云资源**全部通过 `volcenginecc`（Cloud Control）Provider 创建**，并配合 `hashicorp/time` Provider 提供仅在销毁时生效的等待屏障；通过中转路由器 Transit Router 将 dmz / dev / prd 三个 VPC 组成星型拓扑，把公网出向收敛到 dmz NAT、公网入向收敛到 dmz 公网 ALB，并将 NAT EIP 与所有可用区的 ALB EIP 纳入共享带宽包，一键 `terraform apply` 即可完成交付。
 
 ## 1. 业务背景
 
@@ -21,7 +21,7 @@
 - **出向层**：dmz VPC 内的公网 NAT 网关 + 单一 EIP 承载统一出向，dev VPC 默认路由经 TR 收敛到此出向。
 - **路由枢纽**：中转路由器 Transit Router 作为中央路由枢纽，dmz / dev / prd 三 VPC 各挂一个 VPC Attachment，专用 TR 子网作为连接点。
 - **工作负载层**：dev / prd 两个业务 VPC 跨可用区部署 ECS，dmz VPC 仅承载出入口组件。
-- **带宽聚合**：NAT EIP 与 ALB 内置 EIP 纳入同一共享带宽包，集中议价、计费、限速。
+- **带宽聚合**：1 个 NAT EIP 与每个可用区各 1 个的 ALB 内置 EIP 纳入同一共享带宽包，集中议价、计费、限速。
 - **安全控制**：每 VPC 独立安全组，非 dmz VPC 额外放通 dmz 业务子网网段以支持 ALB 跨 VPC 回源。
 
 ### 架构图
@@ -38,7 +38,7 @@ flowchart LR
         direction TB
         bp["📦 vpc_bandwidth_package<br/>shared 共享带宽包"]:::main
         nat_eip["🔢 vpc_eip<br/>NAT 出向 EIP"]:::main
-        alb_eip["🔢 ALB 内置 EIP<br/>由 ALB eip_billing_config 创建"]:::main
+        alb_eip["🔢 ALB 内置 EIP x2<br/>每 AZ 1 个，由 eip_billing_config 创建"]:::main
         nat["🚪 natgateway_ngw<br/>公网 NAT 网关"]:::main
         alb["🛡️ alb_load_balancer<br/>公网 ALB 多 AZ"]:::main
 
@@ -108,7 +108,7 @@ flowchart LR
     note_nat["📌 NAT 出向<br/>spec=Small<br/>SNAT 源 dev CIDR<br/>EIP 直挂 NAT instance_type=Nat"]:::note
     nat -.-> note_nat
 
-    note_bp["📌 带宽包<br/>聚合 NAT 与 ALB EIP<br/>billing_type=2 BGP"]:::note
+    note_bp["📌 带宽包<br/>聚合 NAT EIP + 2 个 ALB EIP<br/>billing_type=2 BGP"]:::note
     bp -.-> note_bp
 ```
 
@@ -116,7 +116,7 @@ flowchart LR
 
 ### 3.1 资源清单
 
-本工程实际创建的资源（**全部使用 volcenginecc Provider**），按一次 `terraform apply` 创建的真实数量统计：
+本工程实际创建的资源（**云资源全部使用 volcenginecc Provider**），按一次默认配置的 `terraform apply` 创建的真实数量统计：
 
 | Terraform 资源                                 | 数量     | 用途                                                                                                                 |
 | -------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------ |
@@ -128,17 +128,19 @@ flowchart LR
 | volcenginecc\_transitrouter\_transit\_router\_route\_entry | 1 | TR 静态默认路由 0.0.0.0/0 → dmz Attachment，供 dev VPC 经 dmz NAT 统一出向                              |
 | volcenginecc\_vpc\_vpc                       | 3      | dmz / dev / prd 三个业务 VPC                                                                                           |
 | volcenginecc\_vpc\_subnet                    | 12     | 每 VPC 4 个子网（2 业务 + 2 TR），跨 AZ                                                                                      |
-| volcenginecc\_vpc\_route\_table              | 3      | dev/prd 由 `modules/tr-vpc` 创建（RFC1918 → TR，dev 加 0.0.0.0/0 → TR）；dmz 由根模块创建（0.0.0.0/0 → NatGW + dev/prd CIDR → TR） |
+| volcenginecc\_vpc\_route\_table              | 3      | 三张自定义路由表均由根模块创建：dev/prd（RFC1918 → TR，dev 加 0.0.0.0/0 → TR）；dmz（0.0.0.0/0 → NatGW + dev/prd CIDR → TR） |
 | volcenginecc\_vpc\_security\_group           | 3      | 每 VPC 默认安全组（基线 22/80/443 放通 + 非 dmz VPC 加 ALB 回源段）                                                                 |
 | volcenginecc\_natgateway\_ngw                | 1      | dmz VPC 公网 NAT 网关，承载统一出向                                                                                           |
 | volcenginecc\_natgateway\_snatentry          | 1      | dev VPC CIDR → NAT EIP 的 SNAT 规则                                                                                   |
 | volcenginecc\_vpc\_eip                       | 1      | NAT 出向专用 EIP（`instance_type=Nat` 直接绑定到 NAT，无需独立 associate 资源）                                                      |
-| volcenginecc\_vpc\_bandwidth\_package        | 1      | 共享带宽包：聚合 NAT EIP 与 ALB 自动创建的 EIP                                                                                   |
+| volcenginecc\_vpc\_bandwidth\_package        | 1      | 共享带宽包：聚合 1 个 NAT EIP 与 2 个跨 AZ 的 ALB 自动创建 EIP                                                                       |
 | volcenginecc\_alb\_load\_balancer            | 1      | dmz VPC 内多 AZ 公网 ALB；EIP 由 `eip_billing_config` 自动创建（不是独立 resource）                                                |
 | volcenginecc\_alb\_server\_group             | 1      | ALB 后端服务器组（IP 类，绑定 prd ECS 私网 IP）                                                                                  |
 | volcenginecc\_alb\_listener                  | 1      | ALB HTTP:80 监听器，关联默认服务器组                                                                                           |
 | volcenginecc\_ecs\_instance                  | 4      | dev × 2 + prd × 2，跨业务子网 / AZ 部署                                                                                    |
-| **合计**                                       | **44** | <br />                                                                                                             |
+| **云资源小计**                                   | **44** | 以上均为 volcenginecc Provider 管理                                                                                            |
+| time\_sleep（hashicorp/time）                 | 7      | 仅设置 `destroy_duration` 的等待屏障：子网 1、TR Attachment 间隔 2、TR 组间 2、安全组 1、NAT 网关 1；不影响 apply 耗时                          |
+| **总计**                                       | **51** | 44 个云资源 + 7 个 `time_sleep`                                                                                       |
 
 ### 3.2 工程结构
 
@@ -150,7 +152,7 @@ dmz-vpc/
 ├── variables.tf             # 全局输入变量（含 vpcs 拓扑、TR/NAT/ALB/ECS 配置、安全组规则）
 ├── outputs.tf               # 关键资源输出（TR ID、VPC ID、EIP、ALB DNS、ECS IP 等）
 ├── providers.tf             # volcenginecc Provider 配置（仅根模块，region 来自变量）
-├── versions.tf              # Terraform >= 1.4.0 与 Provider ~> 0.0.70 版本约束
+├── versions.tf              # Terraform >= 1.4.0，Provider 版本约束：volcenginecc ~> 0.0.70、time ~> 0.9
 ├── locals.tf                # 公共标签 + dmz/dev/prd key 常量
 ├── terraform.tfvars         # 默认变量值（已含 cn-beijing Rocky Linux 9.5 镜像 ID）
 ├── README.md                # 本文档
@@ -158,7 +160,7 @@ dmz-vpc/
     ├── tr-vpc/              # 单 VPC 模块：仅创建 VPC + 业务/TR 子网，并输出 TR 连接点 tr_attach_points
     │                        # （TR Attachment 与 VPC 路由表统一在根模块创建，以便串行化并打破依赖环）
     ├── nat/                 # NAT 模块：NAT 网关 + 直挂 EIP + SNAT 规则
-    ├── alb/                 # ALB 模块：ALB（含自动 EIP）+ 服务器组 + 监听器
+    ├── alb/                 # ALB 模块：ALB（每 AZ 自动 EIP）+ 服务器组 + 监听器
     └── ecs/                 # ECS 模块：多 AZ ECS 实例（含 lifecycle.ignore_changes 抑制 Provider drift）
 ```
 
@@ -207,7 +209,7 @@ resource "volcenginecc_vpc_route_table" "dmz" {
   depends_on = [volcenginecc_transitrouter_vpc_attachment.dmz]
 }
 
-# 共享带宽包：聚合 NAT EIP 与 ALB 自动创建的 EIP
+# 共享带宽包：聚合 1 个 NAT EIP 与所有 AZ 的 ALB EIP
 resource "volcenginecc_vpc_bandwidth_package" "shared" {
   bandwidth_package_name = "${var.name_prefix}-shared-bp"
   bandwidth              = var.shared_bandwidth_package_mbps
@@ -216,7 +218,9 @@ resource "volcenginecc_vpc_bandwidth_package" "shared" {
   protocol               = "IPv4"
   eip_addresses = concat(
     [{ allocation_id = module.nat.eip_id }],
-    module.alb.alb_eip_allocation_id == null ? [] : [{ allocation_id = module.alb.alb_eip_allocation_id }],
+    [for allocation_id in module.alb.alb_eip_allocation_ids : {
+      allocation_id = allocation_id
+    }],
   )
 }
 ```
@@ -247,26 +251,38 @@ output "tr_attach_points" {
 }
 ```
 
-根模块 TR Attachment 串行链（关键修复，节选）：
+根模块 TR Attachment 串行链（关键修复，节选）。三个 Attachment 之间用仅销毁生效的 `time_sleep` 隔开：创建时仍为 `dmz → dev → prd` 串行，销毁时反向并在每两级之间等待 10 秒：
 
 ```hcl
-# 三个 Attachment 串行：dmz → dev → prd
+# dmz Attachment（创建链起点）
 resource "volcenginecc_transitrouter_vpc_attachment" "dmz" {
   transit_router_id = volcenginecc_transitrouter_transit_router.main.transit_router_id
   vpc_id            = module.vpcs["dmz"].vpc_id
   attach_points     = module.vpcs["dmz"].tr_attach_points
 }
 
+# 销毁时在 dev 删除后、dmz 删除前等待 10s
+resource "time_sleep" "after_dmz_attachment" {
+  destroy_duration = "10s"
+  depends_on       = [volcenginecc_transitrouter_vpc_attachment.dmz]
+}
+
 resource "volcenginecc_transitrouter_vpc_attachment" "dev" {
   # ...
   attach_points = module.vpcs["dev"].tr_attach_points
-  depends_on    = [volcenginecc_transitrouter_vpc_attachment.dmz]
+  depends_on    = [time_sleep.after_dmz_attachment]
+}
+
+# 销毁时在 prd 删除后、dev 删除前等待 10s
+resource "time_sleep" "after_dev_attachment" {
+  destroy_duration = "10s"
+  depends_on       = [volcenginecc_transitrouter_vpc_attachment.dev]
 }
 
 resource "volcenginecc_transitrouter_vpc_attachment" "prd" {
   # ...
   attach_points = module.vpcs["prd"].tr_attach_points
-  depends_on    = [volcenginecc_transitrouter_vpc_attachment.dev]
+  depends_on    = [time_sleep.after_dev_attachment]
 }
 ```
 
@@ -305,7 +321,7 @@ resource "volcenginecc_ecs_instance" "this" {
 - 在目标区域（默认 `cn-beijing`）开通 **VPC、中转路由器 TR、NAT 网关、应用型负载均衡 ALB、EIP、共享带宽包、ECS** 等服务。
 - 首次使用 ALB 需在控制台完成服务关联角色授权，否则创建 ALB 会因缺少 `ServiceRoleForALB` 报错。
 - 确认目标可用区（默认 `cn-beijing-a` / `cn-beijing-c`）下 ECS 规格、EIP 与带宽包库存可用。
-- 确认账号 EIP、共享带宽包等资源配额充足（本工程默认创建 2 个 EIP + 1 个共享带宽包）。
+- 确认账号 EIP、共享带宽包等资源配额充足（本工程默认创建 3 个 EIP：1 个 NAT EIP + 2 个跨 AZ 的 ALB EIP，以及 1 个共享带宽包）。
 
 **执行账号权限准备**（最小权限原则）：
 
@@ -360,7 +376,7 @@ export TF_VAR_ecs_config='{ image_id = "image-xxxx", password = "<placeholder>" 
 | `nat_gateway_spec` | `Small` | dmz NAT 网关规格 |
 | `nat_eip_bandwidth_mbps` | `5` | NAT 出向 EIP 带宽（Mbps） |
 | `alb_eip_bandwidth_mbps` | `5` | ALB 内置 EIP 带宽（Mbps） |
-| `shared_bandwidth_package_mbps` | `10` | 共享带宽包总带宽，需 ≥ 各 EIP 带宽之和 |
+| `shared_bandwidth_package_mbps` | 示例 `15`（变量默认 `10`） | 共享带宽包总带宽，需 ≥ 各 EIP 带宽之和 |
 | `alb_config` | `IPv4` / `Standard` / `HTTP` / `80` / `/` | ALB IP 版本、版本、监听协议/端口、健康检查 URI |
 | `ecs_config.image_id` | 示例公共镜像 ID | 必须替换为目标地域可用镜像；默认值为 cn-beijing Rocky Linux 9.5 |
 | `ecs_config.instance_type` | `ecs.g3i.large` | ECS 规格 |
@@ -419,12 +435,12 @@ ecs_config = {
 
 ### 4.5 部署预期结果
 
-`terraform apply` 成功后，默认（`instances_per_subnet = 1`）会创建 **44 个资源**，核心可见结果如下：
+`terraform apply` 成功后，默认（`instances_per_subnet = 1`）会创建 **51 个资源**（44 个云资源 + 7 个仅销毁生效的 `time_sleep`），核心可见结果如下：
 
 - 1 个中转路由器 TR + 1 张 TR 自定义路由表（3 association + 3 propagation + 1 条 `0.0.0.0/0` 静态默认路由）。
 - 3 个 VPC（dmz / dev / prd），每 VPC 4 个子网（2 业务 + 2 TR，跨 AZ）、1 个安全组、1 张 VPC 路由表 + 3 个 TR VPC Attachment。
-- dmz VPC 内：1 个公网 NAT 网关 + 1 个 NAT EIP + 1 条 SNAT 规则；1 个多 AZ 公网 ALB（自带 EIP）+ 1 个 IP 类服务器组 + 1 个 HTTP:80 监听器。
-- 1 个共享带宽包，聚合 NAT EIP 与 ALB EIP。
+- dmz VPC 内：1 个公网 NAT 网关 + 1 个 NAT EIP + 1 条 SNAT 规则；1 个多 AZ 公网 ALB（每 AZ 自带 1 个 EIP，共 2 个）+ 1 个 IP 类服务器组 + 1 个 HTTP:80 监听器。
+- 1 个共享带宽包，聚合 1 个 NAT EIP 与 2 个 ALB EIP。
 - dev × 2 + prd × 2 共 4 台 ECS。
 
 通过 `terraform output` 查看关键输出：
@@ -442,14 +458,15 @@ terraform output
 | `tr_attachment_ids` | 三个 VPC 的 TR Attachment ID 映射 |
 | `security_group_ids` | 三个 VPC 的安全组 ID 映射 |
 | `nat_gateway_id` / `nat_eip_address` | NAT 网关 ID 与出向公网 IP |
-| `alb_id` / `alb_dns_name` / `alb_eip_address` | ALB ID、DNS 名称与入向公网 IP |
+| `alb_id` / `alb_dns_name` | ALB ID 与 DNS 名称 |
+| `alb_eip_address` / `alb_eip_addresses` | 第一个入向公网 IP 与全部可用区入向公网 IP 列表 |
 | `shared_bandwidth_package_id` | 共享带宽包 ID |
 | `dev_instance_ids` / `prd_instance_ids` | dev / prd ECS 实例 ID 映射 |
 | `prd_backend_ips` | 注册到 ALB 后端的 prd ECS 私网 IP |
 
 **业务连通性验证**（对齐集中式公网出入口设计目标）：
 
-1. **入向（跨 VPC 后端）**：在 prd ECS 上启动 80 端口测试服务，访问 `terraform output alb_eip_address` 对应的公网 IP，确认请求经 ALB → TR → prd ECS 返回预期内容；在 ALB 控制台确认跨 VPC 后端服务器组健康检查为正常。
+1. **入向（跨 VPC 后端）**：在 prd ECS 上启动 80 端口测试服务，逐一访问 `terraform output -json alb_eip_addresses` 中的每个公网 IP（对应各可用区），确认请求经 ALB → TR → prd ECS 返回预期内容；在 ALB 控制台确认跨 VPC 后端服务器组健康检查为正常。
 2. **dev 统一出向**：登录 dev ECS 访问公网地址（如 `curl ifconfig.me`），确认能正常出网，且出口公网 IP 为 `nat_eip_address`（即经 dmz NAT 统一出向）。
 3. **prd 默认不出向**：登录 prd ECS 执行相同访问，确认其默认**不能**直接出网（prd `outbound=false`，未注册 SNAT）。
 4. **路由完整性**：核对 TR 自定义路由表与 dmz/dev/prd 三张 VPC 路由表，确认去程与回程路径完整，且不存在绕过 dmz 的公网默认路由。
@@ -478,19 +495,24 @@ terraform show -json | ...                          # 解析 custom_route_entrie
 terraform destroy -auto-approve
 ```
 
-> ℹ️ 创建侧的 TR 操作已在代码中串行化，销毁时 Terraform 会按反向依赖链逐个删除 TR 资源。此外工程在 TR 资源之间插入了两个 `time_sleep`（仅 `destroy_duration = "10s"`，不影响 apply）：销毁时「assoc/propagation 删完 → 等 10s → 删 TR 路由表 → 等 10s → 删 TR Attachment」，给 TR 状态机留出收敛时间，规避 `InvalidTransitRouter.InvalidStatus`。因此一般无需 `-parallelism=1`。若在个别环境下仍偶发 `InvalidStatus`，可追加 `-parallelism=1` 后重跑：
+> ℹ️ 创建侧的 TR 操作已在代码中串行化。所有 `time_sleep` 均只设置 `destroy_duration`，不会拖慢 apply。TR 销毁链为「assoc/propagation 删完 → 等 10s → 删 TR 路由表 → 等 10s → 删 prd Attachment → 等 10s → 删 dev Attachment → 等 10s → 删 dmz Attachment」，给共享状态机留出逐级收敛时间。因此一般无需 `-parallelism=1`；若仍偶发 `InvalidStatus`，可追加 `-parallelism=1` 后重跑：
 >
 > ```bash
 > terraform destroy -auto-approve -parallelism=1
 > ```
 
-> ⚠️ 销毁会按依赖顺序删除：ALB 监听器/服务器组 → ALB → 共享带宽包 → ECS → SNAT → NAT EIP → NAT → 安全组 → 路由表 → TR Attachment → 子网 → VPC → TR。务必先把 ALB 上的业务流量切走再 destroy。
-
-> ⚠️ **`InvalidVpc.InUse`** **处理**：火山云每个 VPC 创建时会自动生成 1 个默认安全组 + 1 个默认路由表（系统资源，不在 Terraform 状态中）。VPC 删除前需要先把它们清理掉，否则 destroy 会报 `InvalidVpc.InUse: ... dependent resource of a security group / route table`。处理方式：
+> ℹ️ ECS 模块与安全组之间还设有一个仅销毁生效的 30 秒等待屏障。销毁时 ECS 删除完成后会等待主网卡（ENI）状态收敛，再删除安全组，避免 `InvalidEni.InvalidStatus`。
 >
-> 1. 在控制台手动删除 VPC 下所有非默认安全组与路由表；
-> 2. 或者用 `terraform import` 把残留的默认 SG/RT 引入临时工程后 `terraform destroy`；具体 ID 可用 `data "volcenginecc_vpc_vpc"` 查询 `security_group_ids` / `route_table_ids` 字段获取。
-> 3. 系统级路由表会随 VPC 删除自动回收，不需要单独处理。
+> ℹ️ NAT 销毁链为「SNAT → NAT EIP → 等 30s → NAT Gateway」。ALB、NAT、ECS、VPC 路由表和 TR Attachment 全部删除后，还会统一等待 30 秒再删除业务子网与 TR 子网，避免托管 ENI、主网卡或路由表关联尚未清理时触发 `InvalidSubnet.InUse`。
+>
+> ⚠️ Terraform 会并行执行互不依赖的销毁分支，固定等待的最长关键路径约 70 秒，不包含各云资源 API 自身耗时。务必先把 ALB 上的业务流量切走再 destroy。
+
+> ⚠️ **`InvalidVpc.InUse`** **处理**：火山云每个 VPC 创建时会自动生成 1 个默认安全组 + 1 个默认路由表，它们是系统资源，通常随 VPC 删除自动回收，**不需要也不应手动删除**。若 destroy 报 `InvalidVpc.InUse: ... dependent resource of a security group / route table`，一般说明 VPC 中仍残留 Terraform 未成功删除或未纳管的**自定义（非默认）**安全组、路由表或其关联 ENI。处理方式：
+>
+> 1. 用 `data "volcenginecc_vpc_vpc"` 查询 `security_group_ids` / `route_table_ids`，区分默认资源与自定义资源；
+> 2. 在控制台删除残留的**自定义（非默认）**安全组与路由表；删除安全组前先确认其关联 ENI 已释放（参见 `InvalidEni.InvalidStatus`）；
+> 3. 若希望用 Terraform 回收残留的自定义资源，可在临时工程中 `terraform import` 后再 `terraform destroy`；**不要 import 默认系统资源**；
+> 4. 重新执行 `terraform destroy`，默认安全组与路由表会随 VPC 一并回收。
 >
 > <br />
 
@@ -499,7 +521,7 @@ terraform destroy -auto-approve
 本方案的主要优势：
 
 - **标准化交付**：通过 Terraform 统一创建网络、路由、公网出向、公网入向、带宽聚合与工作负载资源，一键 `terraform apply` 即可完成集中式公网出入口环境的交付。
-- **集中治理**：跨 VPC 路由集中在 TR 自定义路由表（association + propagation + 静态默认路由，声明式全托管），安全组规则集中在根模块编排，NAT EIP 与 ALB EIP 集中纳入共享带宽包，符合 Landing Zone“集中式治理”的最佳实践。
+- **集中治理**：跨 VPC 路由集中在 TR 自定义路由表（association + propagation + 静态默认路由，声明式全托管），安全组规则集中在根模块编排，NAT EIP 与各可用区 ALB EIP 集中纳入共享带宽包，符合 Landing Zone“集中式治理”的最佳实践。
 - **稳定创建**：所有涉及 Transit Router 的资源在根模块按 `dmz → dev → prd` 串行创建，规避 TR 并发操作导致的 `InvalidStatus`，无需手动 `-parallelism=1`；dmz / dev / prd 的 VPC 路由表统一在根模块创建以打破模块与 Attachment 之间的依赖环。
 - **多 AZ 高可用**：所有子网（业务子网 + TR 子网）默认跨 AZ 分布，ALB 跨 AZ 部署，ECS 跨子网创建，原生支持高可用。
 - **模块化复用**：按 `tr-vpc`（网络底座）/ `nat`（出向）/ `alb`（入向）/ `ecs`（工作负载）拆分模块，便于按需组合与独立升级。
