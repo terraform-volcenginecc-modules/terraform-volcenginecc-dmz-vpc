@@ -1,6 +1,6 @@
-# DMZ-VPC 统一公网出入口 Landing Zone
+# DMZ-VPC 统一公网出入口
 
-在火山引擎上一键部署一套集中式的公网出入口 Landing Zone，覆盖网络、路由、公网出向（NAT）、公网入向（ALB）、带宽聚合与工作负载等核心资源。方案基于 `volcenginecc`（Cloud Control）Provider 创建全部云资源，并配合 `hashicorp/time` Provider 提供仅在销毁时生效的等待屏障；通过中转路由器 Transit Router 将 dmz / dev / prd 三个 VPC 组成星型拓扑，把公网出向收敛到 dmz NAT、公网入向收敛到 dmz 公网 ALB，并将 NAT EIP 与各可用区的 ALB EIP 纳入共享带宽包。
+部署一套集中式的公网出入口，覆盖网络、路由、公网出向（NAT）、公网入向（ALB）、带宽聚合与工作负载等核心资源，通过中转路由器 Transit Router 将三个 VPC 组成星型拓扑，把公网出向收敛到 dmz NAT、公网入向收敛到 dmz 公网 ALB，并将 NAT EIP 与各可用区的 ALB EIP 纳入共享带宽包。
 
 ## 1. 业务背景
 
@@ -117,7 +117,7 @@ flowchart LR
 
 ### 3.1 资源清单
 
-按变量当前默认值与 `terraform.tfvars` 示例值计算（`instances_per_subnet = 1`，每 VPC 2 个业务子网、2 个 TR 子网，跨 2 个可用区），一次 `terraform apply` 共创建 44 个云资源，另有 7 个 `time_sleep` 辅助资源：
+按变量当前默认值与 `terraform.tfvars` 示例值计算（`instances_per_subnet = 1`，每 VPC 2 个业务子网、2 个 TR 子网，跨 2 个可用区），一次 `terraform apply` 共创建 44 个云资源：
 
 | Terraform 资源 | 数量 | 用途 |
 | --- | --- | --- |
@@ -140,7 +140,6 @@ flowchart LR
 | `volcenginecc_alb_listener` | 1 | ALB HTTP:80 监听器，关联默认服务器组 |
 | `volcenginecc_ecs_instance` | 4 | dev × 2 + prd × 2，跨业务子网 / AZ 部署 |
 | **云资源合计** | **44** | 均由 `volcenginecc` Provider 管理 |
-| `time_sleep`（`hashicorp/time`） | 7 | 仅 `destroy_duration` 的销毁等待屏障（子网 1、TR Attachment 2、TR 路由表前后各 1、安全组 1、NAT 1），不计入云资源数量 |
 
 补充说明：
 
@@ -225,13 +224,6 @@ resource "volcenginecc_vpc_bandwidth_package" "shared" {
 }
 ```
 
-> 子模块内部输出（仅供根模块引用，不属于用户关注的交付输出）：
->
-> - `modules/tr-vpc`：`vpc_id`、`vpc_name`、`vpc_cidr_block`、`business_subnet_ids`、`business_subnet_zone_ids`、`tr_subnet_ids`、`tr_attach_points`。
-> - `modules/nat`：`nat_gateway_id`、`eip_id`、`eip_address`。
-> - `modules/alb`：`alb_id`、`alb_dns_name`、`alb_eip_address`、`alb_eip_addresses`、`alb_eip_allocation_id`、`alb_eip_allocation_ids`、`server_group_id`、`listener_id`。
-> - `modules/ecs`：`instance_ids`、`private_ips`、`private_ip_list`。
-
 ## 4. 使用说明
 
 本工程支持通过 InfraManager 在云上一键部署或下载模板在本地运行。推荐使用云上部署方式，无需自行准备 Terraform 运行环境，只需在平台填写参数即可完成资源创建和托管。
@@ -254,13 +246,11 @@ InfraManager 是火山引擎提供的 Terraform 托管工作台，更多产品�
 
 #### 4.1.2 选择模板
 
-打开 [InfraManager 控制台](https://console.volcengine.com/iac)，进入 **模板管理 > 公开模板**，搜索“DMZ-VPC 统一公网出入口 Landing Zone”。
+打开 [InfraManager 控制台](https://console.volcengine.com/iac)，进入 **模板管理 > 公开模板**，搜索“DMZ-VPC 统一公网出入口”。
 
 #### 4.1.3 创建资源栈
 
 选择模板并点击 **创建资源栈**，根据实际需求填写资源栈信息和模板参数。重点确认 `region`、`zones`、`vpcs`、`ecs_config` 等参数，并在凭证中注入访问密钥。创建并检查执行计划，确认变更符合预期（示例默认预期新增约 51 个资源，其中 44 个云资源 + 7 个仅销毁生效的 `time_sleep`）后，点击 **执行部署**。
-
-> 示例密码 `ReplaceMe@12345` 仅作占位，部署前请在资源栈参数或凭证中覆盖 `ecs_config.password`，并避免写入可被外部访问的环境。
 
 #### 4.1.4 部署验证
 
@@ -381,7 +371,7 @@ terraform apply tfplan
 
 #### 4.2.3 部署预期结果
 
-按默认 `instances_per_subnet = 1` 执行，`terraform apply` 预期新增 **51 个资源**（44 个云资源 + 7 个仅销毁生效的 `time_sleep`）：
+按默认 `instances_per_subnet = 1` 执行，`terraform apply` 预期新增 44 个云资源 + 7 个仅销毁生效的 `time_sleep`：
 
 - 1 个中转路由器 TR + 1 张 TR 自定义路由表（3 条 association + 3 条 propagation + 1 条 `0.0.0.0/0` 静态默认路由）。
 - 3 个 VPC（dmz / dev / prd），每 VPC 4 个子网（2 业务 + 2 TR，跨 AZ）、1 个安全组、1 张 VPC 路由表 + 3 个 TR VPC Attachment。
