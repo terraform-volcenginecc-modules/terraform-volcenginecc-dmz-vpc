@@ -58,7 +58,7 @@ resource "volcenginecc_alb_server_group" "this" {
   health_check = {
     enabled             = "on"
     interval            = 2
-    timeout             = 5
+    timeout             = 2
     method              = "GET"
     healthy_threshold   = 3
     unhealthy_threshold = 3
